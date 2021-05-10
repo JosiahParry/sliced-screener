@@ -1,0 +1,306 @@
+---
+title: "SLICED Screener"
+author: "josiah parry"
+date: "2021-05-09"
+output: html_document
+---
+
+## Challenge 1 
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+The first challenge is to join two tables. We've got this. 
+
+There are two tables one for batters and one for the actual stats for each pitch (I believe). Let's read them both in. I know very little about baseball so we'll be learning as we go. 
+
+
+```{r}
+# we always need to tidy
+library(tidyverse)
+
+# read in the stats
+statcast <- read_csv("/Users/josiah/Downloads/data 2/2019-statcast.csv")
+
+batter_names <- read_csv("/Users/josiah/Downloads/data 2/batter-names.csv")
+```
+
+
+In order to join these two tables we need to figure out what the common identifier is. R doesn't just magically how to relate these two files together—neither do I! Preview the columns of each table to get a sense of which will be used for joining.
+
+
+
+```{r}
+glimpse(batter_names)
+```
+
+We're looking for numeric identifiers and the only one is `key_mlbam` which is a dead giveaway. Also, identifiers in database terminology are called "keys" so that's also our giveaway. 
+
+```{r}
+glimpse(statcast)
+```
+
+In this table we're looking for a numeric column that related to our batter. Here it seems that `batter` is our bet bet. 
+
+We're going to join based on these keys. We're going to use a left join because we want to keep all observations from our original stats. 
+
+```{r}
+statcast_full <- left_join(statcast, batter_names, by = c("batter" =  "key_mlbam"))
+```
+
+
+
+## Challenge 2: Modeling
+
+This is the tough bit. I haven't done any machine learning in quite some time. The R ecosystem has changed a whole lot so we're going to be keeping this simple-ish. 
+
+The approach we're going to be taking will be like:
+
+Fitting tidymodels: 
+
+1. Split the data into training and test initial_split(). 
+1. Using training(init_split) to create resamples
+1. Specify and various preprocessing steps
+1. Specify models to be used 
+1. Define work flows
+1. fit_resamples() on each workflow
+1. OR Create workflowset and run fit_resamples with workflow_map
+
+A lot of these concepts are new to me but it should make sense as we get to our result! 
+
+### Choosing a prediction objective
+
+I'm not a big baseball fan, so figuring out what to model is a bit of a tough choice. The screener provides a few recommendations—some of which don't exist unfortunately. After a quick perusal `description` will be our outcome of choice. This is the outcome of each pitch. 
+
+Each time a ball is thrown in baseball it is either hit, swung and missed (a strike), or hit out of bounds (a foul), the pitcher throws the ball to far away from the batter (a ball; 4 balls is a free walk to first base), or the pitcher throws the ball and the batter doesn't swing and it's ruled in the strike zone it is then a strike. 
+
+```{r}
+pitch_counts <- count(statcast, description, sort = TRUE)
+
+pitch_counts %>% 
+  mutate(outcome = fct_reorder(description, n)) %>% 
+  ggplot(aes(n, outcome)) +
+  geom_col() +
+  theme_light() +
+  labs(title = "Pitch outcomes by frequency", x = "Frequency", y = "")
+```
+It appear that there a number of additional outcomes with only a very few number of observations. For simplicity's sake we're going to only address the 5 most common outcomes.  
+
+### Data pre-preprocessing
+
+
+Prior to the modeling phase we need to get the data into shape for it—this is really just getting rid of missing data for this simple use case. In this case I've identified some columns from the dataset that I think are related to outcome variable. I'll be making sure these don't have any missing values. 
+
+But why these variables? Well, I can't be too sure. I've just used my best guesses! When we look at the dataset we want to find variables that are likely related to the outcome in some way. These I've guess might be the ball's velocity, release speed, and also where the ball crosses the plate with respect to the batters strike zone (the area in which a pitch can be deemed a strike if the ball).
+
+```{r}
+# only predict these 5 classes 
+descriptions <- c("ball", "called_strike", "foul", "hit_into_play", "swinging_strike")
+
+
+pitches_full <- statcast %>% 
+  filter(description %in% descriptions) %>% 
+  filter(if_all(c(plate_x, plate_z, sz_top, sz_bot, 
+                  vx0, vy0, vz0, ax, ay, az, release_speed, release_pos_x,
+                  release_pos_y, release_pos_z, release_spin_rate,
+                  release_extension, release_pos_y), 
+                ~!is.na(.))) %>%
+  select(description, plate_x, plate_z, sz_top, sz_bot, 
+                  vx0, vy0, vz0, ax, ay, az, release_speed, release_pos_x,
+                  release_pos_y, release_pos_z, release_spin_rate,
+                  release_extension, release_pos_y)
+  
+
+```
+
+It may be helpful to explore if any of these variables are correlated with each other.
+
+```{r}
+pitches_full %>% 
+  select(-description) %>% 
+  cor() %>% 
+  corrplot::corrplot(type = "lower")
+```
+
+### Data Partitioning
+
+Now that we've got the data we want and need, it makes sense to begin partition our data into a training set and a testing set for later validation. Let's load tidymodels now as we'll use it for our model fit. We're also going to use `tidymodels_prefer()` so that in the case of conflicting function names the tidymodels ones will be available for us without calling it from the namespace (package name).
+
+```{r}
+library(tidymodels)
+tidymodels_prefer()
+```
+
+We're going to split it now. To ensure that we have rows from each descrption type we're going to use stratified sampling by setting the `strata` argument. 
+
+
+```{r}
+init_split <- initial_split(pitches_full, strata = "description")
+
+training_df <- training(init_split)
+testing_df <- testing(init_split)
+```
+
+Next we're going to prepare the training data for cross validation—with only five folds to keep the computation time reasonable. 
+
+```{r}
+folds <- vfold_cv(training_df, v = 5)
+```
+
+
+### Model definition / pre-processing
+
+The first step in creating the models will be to create a `recipe`. This is an object that keeps track of what we're predicting, with what, and what we're doing to our data before we model it. 
+
+The simplest recipe is just a model formula. I want to keep it simple! So here we're going to define two model recipes. The first will look at what I think is related to the batter's abilities. The second will incorporate pitcher info. 
+
+The features should be able to capture the batters abilities and contribution to the pitch outcome. The second model intends to incorporate the pitch itself, primarily through pitch release positions and spin rate. The second model specification will incorporate more of the factors of the pitch itself. 
+
+
+```{r}
+simple_rec <- recipe(description ~ plate_x + plate_z + sz_top + sz_bot,
+                     data = training_df)
+
+release_rec <- recipe(description ~ plate_x + plate_z + sz_top + sz_bot +
+                        release_pos_y + release_pos_x + release_pos_z + release_spin_rate,
+                      data = training_df) %>% 
+  themis::step_downsample(description)
+```
+
+
+### Model Specification
+
+The next thing we want to do is to define which models we're going to fit. Our goal is classification and, if memory serves, tree models are good and fast at this. Additionally, since we've got a whole bunch of observations, why not try fitting a neural network? Neural nets are best used on a whole lot of data, I'm not sure we're there yet. 
+
+```{r}
+# Trees
+c5_spec <- decision_tree() %>% 
+  set_mode("classification") %>% 
+  set_engine("C5.0")
+
+xgb_spec <- boost_tree() %>% 
+  set_engine("xgboost") %>% 
+  set_mode("classification")
+
+# nnet
+nn_spec <- mlp() %>% 
+  set_mode("classification") %>% 
+  set_engine("nnet")
+```
+
+
+In the above code chunk we specified three different models: a C5.0 decision tree, XGboost decision tree, and a multilayer perceptron neural network.
+
+### Model training
+
+To train the models we're going to use a workflow set. This will apply each model specification to each model recipe / definition.
+
+```{r}
+wfs <- workflow_set(preproc = list(simple = simple_rec, release = release_rec),
+             models = list(c5 = c5_spec, xgb = xgb_spec, nn = nn_spec))
+
+wfs
+```
+
+Now that we have the workflows specified, we want to train them on our cross validation folds. 
+
+First I'll configure doParallel to parallelize the operations. 
+
+```{r}
+doParallel::registerDoParallel(cores = 4)
+```
+
+Now we fit our models 
+
+```{r}
+wfs_fits <- workflow_map(wfs, fn = "fit_resamples", verbose = TRUE,
+                         resamples = folds)
+
+# save object because I don't want to rerun
+#readr::write_rds(wfs_fits, "wfs_fits.rds")
+```
+
+```{r}
+readr::read_rds("wfs_fits.rds")
+```
+
+
+Find the best model. 
+
+```{r}
+collect_metrics(wfs_fits) %>% 
+ # filter(.metric == "roc_auc") %>% 
+  arrange(-mean)
+```
+Now that we've trained a bunch of models and have identified the best one, let's grab it and fit one last model on the entire training set. 
+
+```{r}
+best_model <- wfs %>% 
+  pull_workflow("release_xgb")
+```
+
+Now that we've got the best workflow, lets fit it. 
+
+```{r}
+final_fit <- last_fit(best_model, init_split)
+
+collect_metrics(final_fit)
+```
+
+
+
+
+## Challenge # 3 
+
+With our final model in hand, let's visualize its performance. Below is a confusion matrix for our model.
+
+```{r}
+model_conf_mat <- final_fit %>% 
+  collect_predictions() %>% 
+  select(.pred_class) %>% 
+  bind_cols(select(testing_df, true_class = description)) %>% 
+  conf_mat(true_class, .pred_class) 
+
+knitr::kable(model_conf_mat$table)
+```
+We can also visualize the confusion matrix. 
+
+```{r}
+autoplot(model_conf_mat) +
+  labs(title = "Pitch outcome confusion matrix")
+```
+Additionally we ought to visualize the ROC curve for our class predictions. 
+
+```{r}
+# plot the ROC curve
+final_fit %>% 
+  collect_predictions() %>% 
+  roc_curve(description, .pred_ball:.pred_swinging_strike) %>% 
+  autoplot() + 
+  theme_light()
+```
+
+Balls is the best predicted most likely due to the sheer quantity.
+
+Is there a difference in results based on the speed?
+
+```{r}
+ggplot(pitches_full, aes(release_speed, fill = description)) +
+  geom_histogram() +
+  facet_wrap("description")
+```
+Doesn't necessarily seem like it. 
+
+
+Where do the pitches actually fall across the plate? 
+
+```{r}
+ggplot(pitches_full, 
+       aes(plate_x, plate_z, color = description)) +
+  geom_point(alpha = 0.009) +
+  facet_wrap("description") +
+  theme_light()
+```
+
